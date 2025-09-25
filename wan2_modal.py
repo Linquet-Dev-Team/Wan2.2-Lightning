@@ -72,9 +72,8 @@ image = (
 )
 
 MODEL_PATH = "/models"
-OUTPUT_PATH = "/outputs"
+OUTPUT_PATH = "/tmp"  # Use temporary directory for local video storage before S3 upload
 model_volume = modal.Volume.from_name("wan2-models", create_if_missing=True)
-output_volume = modal.Volume.from_name("wan2-outputs", create_if_missing=True)
 
 
 # Pydantic models for API
@@ -85,6 +84,7 @@ class VideoGenerationRequest(BaseModel):
     seed: Optional[int] = None
     webhook_url: Optional[str] = None
     webhook_token: Optional[str] = None
+    s3_key: Optional[str] = None  # Custom S3 key path for video storage
 
 
 class VideoGenerationResponse(BaseModel):
@@ -119,7 +119,8 @@ with image.imports():
     image=image,
     gpu="H100",
     timeout=20 * 60,
-    volumes={MODEL_PATH: model_volume, OUTPUT_PATH: output_volume},
+    volumes={MODEL_PATH: model_volume},
+    secrets=[modal.Secret.from_name("aws-secret")],
     min_containers=1,  # Keep 1 container warm
     scaledown_window=60 * 15,  # 15 min idle timeout before scaling down
     enable_memory_snapshot=True,  # Memory snapshot for faster cold starts
@@ -302,7 +303,7 @@ class VideoGenerator:
         return image.resize((new_w, new_h), Image.LANCZOS)
 
     def _init_s3_client(self):
-        """Initialize S3 client with environment variables"""
+        """Initialize S3 client with Modal secrets"""
         import boto3
 
         self.s3_bucket = os.environ.get("S3_BUCKET_NAME")
@@ -324,16 +325,23 @@ class VideoGenerator:
             self.s3_client = None
 
     def _upload_to_s3(
-        self, filepath: Path, content_type: str = "video/mp4"
+        self, filepath: Path, custom_s3_key: Optional[str] = None, content_type: str = "video/mp4"
     ) -> Dict[str, str]:
         """Upload file to S3 and return S3 key and URL"""
         if not self.s3_client or not self.s3_bucket:
             return {"s3_key": None, "s3_url": None}
 
         try:
-            # Generate unique S3 key
-            timestamp = int(time.time())
-            s3_key = f"wan2-videos/{timestamp}_{filepath.name}"
+            # Use custom S3 key if provided, otherwise generate unique key
+            if custom_s3_key:
+                s3_key = custom_s3_key
+                # Ensure it ends with .mp4 if not already specified
+                if not s3_key.endswith('.mp4'):
+                    s3_key = f"{s3_key}.mp4"
+            else:
+                # Generate unique S3 key (fallback behavior)
+                timestamp = int(time.time())
+                s3_key = f"wan2-videos/{timestamp}_{filepath.name}"
 
             print(f"📤 Uploading to S3: s3://{self.s3_bucket}/{s3_key}")
             upload_start = time.time()
@@ -347,13 +355,12 @@ class VideoGenerator:
                     "ContentType": content_type,
                     "Metadata": {
                         "source": "wan2-lightning",
-                        "timestamp": str(timestamp),
+                        "timestamp": str(int(time.time())),
                     },
                 },
             )
 
             upload_time = time.time() - upload_start
-            print(f"✅ S3 upload completed in {upload_time:.1f}s")
 
             # Generate public URL (assumes bucket allows public read)
             s3_url = f"https://{self.s3_bucket}.s3.amazonaws.com/{s3_key}"
@@ -361,7 +368,6 @@ class VideoGenerator:
             return {"s3_key": s3_key, "s3_url": s3_url, "upload_time": upload_time}
 
         except Exception as e:
-            print(f"❌ S3 upload failed: {e}")
             return {"s3_key": None, "s3_url": None, "upload_time": 0}
 
     def _send_webhook(
@@ -377,7 +383,6 @@ class VideoGenerator:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                print(f"📡 Sending webhook (attempt {attempt + 1}/{max_retries})")
                 webhook_start = time.time()
 
                 response = requests.post(
@@ -386,16 +391,13 @@ class VideoGenerator:
                 response.raise_for_status()
 
                 webhook_time = time.time() - webhook_start
-                print(f"✅ Webhook sent successfully in {webhook_time:.1f}s")
                 return True
 
             except Exception as e:
-                print(f"❌ Webhook attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     sleep_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
                     time.sleep(sleep_time)
                 else:
-                    print(f"🚨 Failed to send webhook after {max_retries} attempts")
                     return False
 
     def _run_video_generation(
@@ -404,6 +406,7 @@ class VideoGenerator:
         prompt: str = DEFAULT_PROMPT,
         num_frames: int = 37,
         seed: Optional[int] = None,
+        s3_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Internal method that does the actual video generation work - following CatVTON pattern"""
         import time
@@ -463,13 +466,10 @@ class VideoGenerator:
         save_time = time.time() - save_start
         print(f"💾 Step 2 completed: Video save took {save_time:.1f}s")
 
-        print(f"📋 Step 3: Committing to volume...")
-        commit_start = time.time()
-
-        output_volume.commit()
-
-        commit_time = time.time() - commit_start
-        print(f"☁️ Step 3 completed: Volume commit took {commit_time:.1f}s")
+        # Step 3: Upload to S3
+        print(f"📋 Step 3: Uploading to S3...")
+        s3_result = self._upload_to_s3(filepath, custom_s3_key=s3_key)
+        s3_upload_time = s3_result.get("upload_time", 0)
 
         print(f"📋 Step 4: Cleaning up...")
         cleanup_start = time.time()
@@ -488,27 +488,18 @@ class VideoGenerator:
             f"   - Video save: {save_time:.1f}s ({save_time/total_generation_time*100:.1f}%)"
         )
         print(
-            f"   - Volume commit: {commit_time:.1f}s ({commit_time/total_generation_time*100:.1f}%)"
-        )
-        print(
             f"   - Cleanup: {cleanup_time:.1f}s ({cleanup_time/total_generation_time*100:.1f}%)"
         )
 
-        # Step 5: Upload to S3
-        print(f"📋 Step 5: Uploading to S3...")
-        s3_result = self._upload_to_s3(filepath)
-        s3_upload_time = s3_result.get("upload_time", 0)
-
         # Update total time including S3 upload
         total_time_with_s3 = time.time() - step_start
-        print(f"☁️ Step 5 completed: S3 upload took {s3_upload_time:.1f}s")
+        print(f"☁️ Step 3 completed: S3 upload took {s3_upload_time:.1f}s")
         print(f"🎯 TOTAL TIME WITH S3: {total_time_with_s3:.1f}s")
 
         # Compile performance metrics
         performance = {
             "inference_time": round(inference_time, 2),
             "video_save_time": round(save_time, 2),
-            "volume_commit_time": round(commit_time, 2),
             "cleanup_time": round(cleanup_time, 2),
             "s3_upload_time": round(s3_upload_time, 2),
             "total_generation_time": round(total_generation_time, 2),
@@ -538,6 +529,7 @@ class VideoGenerator:
         prompt: str = DEFAULT_PROMPT,
         num_frames: int = 37,
         seed: Optional[int] = None,
+        s3_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Modal method wrapper for CLI access - following CatVTON pattern"""
         return self._run_video_generation(
@@ -545,6 +537,7 @@ class VideoGenerator:
             prompt=prompt,
             num_frames=num_frames,
             seed=seed,
+            s3_key=s3_key,
         )
 
     @modal.method()
@@ -581,6 +574,7 @@ class VideoGenerator:
                 prompt=request.prompt,
                 num_frames=request.num_frames,
                 seed=request.seed,
+                s3_key=request.s3_key,
             )
 
             # Prepare success webhook payload
@@ -670,6 +664,7 @@ class VideoGenerator:
                 prompt=request.prompt,
                 num_frames=request.num_frames,
                 seed=request.seed,
+                s3_key=request.s3_key,
             )
 
             # Return result using Pydantic response model
@@ -689,7 +684,7 @@ class VideoGenerator:
         except Exception as e:
             return VideoGenerationResponse(
                 success=False, error=f"Video generation failed: {str(e)}"
-            )
+        )
 
 
 @app.local_entrypoint()
@@ -727,13 +722,7 @@ def main(image_path: str, prompt: str, seed: Optional[int] = None):
     s3_url = result.get("s3_url")
     performance = result.get("performance", {})
 
-    # Download locally
-    output_dir = Path("./output")
-    output_dir.mkdir(exist_ok=True)
-    local_path = output_dir / filename
-    local_path.write_bytes(b"".join(output_volume.read_file(filename)))
-
-    print(f"💾 Saved locally: {local_path}")
+    print(f"🎬 Video generated: {filename}")
 
     if s3_key:
         print(f"☁️ S3 Key: {s3_key}")
