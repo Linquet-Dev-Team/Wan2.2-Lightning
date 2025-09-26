@@ -78,6 +78,7 @@ model_volume = modal.Volume.from_name("wan2-models", create_if_missing=True)
 
 # Pydantic models for API
 class VideoGenerationRequest(BaseModel):
+    job_id: Optional[str] = None
     image: str  # URL, base64, or local path
     prompt: str = DEFAULT_PROMPT
     num_frames: int = 37
@@ -121,7 +122,6 @@ with image.imports():
     timeout=20 * 60,
     volumes={MODEL_PATH: model_volume},
     secrets=[modal.Secret.from_name("aws-secret")],
-    min_containers=1,  # Keep 1 container warm
     max_containers=1,  # Keep 1 container warm
     scaledown_window=60 * 20,  # 20 min idle timeout before scaling down (max)
     enable_memory_snapshot=True,  # Memory snapshot for faster cold starts
@@ -326,7 +326,10 @@ class VideoGenerator:
             self.s3_client = None
 
     def _upload_to_s3(
-        self, filepath: Path, custom_s3_key: Optional[str] = None, content_type: str = "video/mp4"
+        self,
+        filepath: Path,
+        custom_s3_key: Optional[str] = None,
+        content_type: str = "video/mp4",
     ) -> Dict[str, str]:
         """Upload file to S3 and return S3 key and URL"""
         if not self.s3_client or not self.s3_bucket:
@@ -337,7 +340,7 @@ class VideoGenerator:
             if custom_s3_key:
                 s3_key = custom_s3_key
                 # Ensure it ends with .mp4 if not already specified
-                if not s3_key.endswith('.mp4'):
+                if not s3_key.endswith(".mp4"):
                     s3_key = f"{s3_key}.mp4"
             else:
                 # Generate unique S3 key (fallback behavior)
@@ -400,6 +403,32 @@ class VideoGenerator:
                     time.sleep(sleep_time)
                 else:
                     return False
+
+    def _process_image(self, image: str) -> bytes:
+        import requests
+        import base64
+        from pathlib import Path
+
+        # Download image from URL (following CatVTON pattern)
+        def download_file(url: str) -> bytes:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            return response.content
+
+        # Handle image input - URL download like CatVTON
+        if image.startswith(("http://", "https://")):
+            image_bytes = download_file(image)
+        else:
+            # Handle base64 or local file (for backward compatibility)
+            if image.startswith("data:image"):
+                _, data = image.split(",", 1)
+                image_bytes = base64.b64decode(data)
+            elif "/" in image or "\\" in image:
+                image_bytes = Path(image).read_bytes()
+            else:
+                image_bytes = base64.b64decode(image)
+
+            return image_bytes
 
     def _run_video_generation(
         self,
@@ -544,30 +573,10 @@ class VideoGenerator:
     @modal.method()
     def process_video_async(self, request: VideoGenerationRequest, job_id: str):
         """Background processing method that sends results via webhook - following CatVTON pattern"""
-        import requests
-        import base64
-        
         try:
             print(f"🔄 Starting async video generation for job {job_id}")
-            
-            # Download image from URL (following CatVTON pattern)
-            def download_file(url: str) -> bytes:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                return response.content
-            
-            # Handle image input - URL download like CatVTON
-            if request.image.startswith(("http://", "https://")):
-                image_bytes = download_file(request.image)
-            else:
-                # Handle base64 or local file (for backward compatibility)
-                if request.image.startswith("data:image"):
-                    header, data = request.image.split(",", 1)
-                    image_bytes = base64.b64decode(data)
-                elif "/" in request.image or "\\" in request.image:
-                    image_bytes = Path(request.image).read_bytes()
-                else:
-                    image_bytes = base64.b64decode(request.image)
+
+            image_bytes = self._process_image(request.image)
 
             # Run the internal generation method directly (like CatVTON _run_inference)
             result = self._run_video_generation(
@@ -621,7 +630,7 @@ class VideoGenerator:
         """
         if request.webhook_url:
             # Async mode - return job ID immediately
-            job_id = str(uuid.uuid4())
+            job_id = request.job_id or str(uuid.uuid4())
             print(f"🚀 Starting async job {job_id}")
             self.process_video_async.spawn(request, job_id)
 
@@ -637,27 +646,9 @@ class VideoGenerator:
     def api_sync(self, request: VideoGenerationRequest) -> VideoGenerationResponse:
         """Internal method for synchronous video generation processing - following CatVTON pattern"""
         import requests
-        import base64
-        
+
         try:
-            # Download image from URL (following CatVTON pattern)
-            def download_file(url: str) -> bytes:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                return response.content
-            
-            # Handle image input - URL download like CatVTON
-            if request.image.startswith(("http://", "https://")):
-                image_bytes = download_file(request.image)
-            else:
-                # Handle base64 or local file (for backward compatibility)
-                if request.image.startswith("data:image"):
-                    header, data = request.image.split(",", 1)
-                    image_bytes = base64.b64decode(data)
-                elif "/" in request.image or "\\" in request.image:
-                    image_bytes = Path(request.image).read_bytes()
-                else:
-                    image_bytes = base64.b64decode(request.image)
+            image_bytes = self._process_image(request.image)
 
             # Call the internal generation method directly (like CatVTON _run_inference)
             result = self._run_video_generation(
@@ -685,7 +676,7 @@ class VideoGenerator:
         except Exception as e:
             return VideoGenerationResponse(
                 success=False, error=f"Video generation failed: {str(e)}"
-        )
+            )
 
 
 @app.local_entrypoint()
@@ -701,6 +692,7 @@ def main(image_path: str, prompt: str, seed: Optional[int] = None):
     # Load image as bytes for consistent handling
     if image_path.startswith(("http://", "https://")):
         import requests
+
         response = requests.get(image_path, timeout=30)
         response.raise_for_status()
         image_bytes = response.content
@@ -709,10 +701,7 @@ def main(image_path: str, prompt: str, seed: Optional[int] = None):
 
     # Call the modal method wrapper for CLI access (like CatVTON)
     result = generator.inference.remote(
-        image_bytes=image_bytes,
-        prompt=prompt,
-        num_frames=37,
-        seed=seed
+        image_bytes=image_bytes, prompt=prompt, num_frames=37, seed=seed
     )
 
     print(f"✅ Done in {time.time() - start:.1f}s")
