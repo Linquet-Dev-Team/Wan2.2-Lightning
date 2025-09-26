@@ -428,7 +428,7 @@ class VideoGenerator:
             else:
                 image_bytes = base64.b64decode(image)
 
-            return image_bytes
+        return image_bytes
 
     def _run_video_generation(
         self,
