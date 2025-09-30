@@ -81,8 +81,11 @@ class VideoGenerationRequest(BaseModel):
     job_id: Optional[str] = None
     image: str  # URL, base64, or local path
     prompt: str = DEFAULT_PROMPT
-    num_frames: int = 37
+    num_frames: int = 49  # Changed from 48 to 49 (follows 4n+1 pattern). Will auto-correct invalid values.
     seed: Optional[int] = None
+    shift: float = 5.0
+    sampling_steps: int = 4
+    guide_scale: float = 1.0
     webhook_url: Optional[str] = None
     webhook_token: Optional[str] = None
     s3_key: Optional[str] = None  # Custom S3 key path for video storage
@@ -92,6 +95,7 @@ class VideoGenerationResponse(BaseModel):
     success: bool
     s3_key: Optional[str] = None
     s3_url: Optional[str] = None
+    cloudfront_url: Optional[str] = None
     filename: Optional[str] = None
     performance: Optional[Dict[str, Any]] = None
     message: Optional[str] = None
@@ -122,6 +126,7 @@ with image.imports():
     timeout=20 * 60,
     volumes={MODEL_PATH: model_volume},
     secrets=[modal.Secret.from_name("aws-secret")],
+    min_containers=1,
     max_containers=1,  # Keep 1 container warm
     scaledown_window=60 * 20,  # 20 min idle timeout before scaling down (max)
     enable_memory_snapshot=True,  # Memory snapshot for faster cold starts
@@ -435,6 +440,9 @@ class VideoGenerator:
         image_bytes: bytes,
         prompt: str = DEFAULT_PROMPT,
         num_frames: int = 37,
+        shift: float = 5.0,
+        sampling_steps: int = 4,
+        guide_scale: float = 1.0,
         seed: Optional[int] = None,
         s3_key: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -465,10 +473,10 @@ class VideoGenerator:
                 img=image,
                 max_area=320 * 576,  # Smaller resolution for faster generation
                 frame_num=num_frames,
-                shift=5.0,  # Lightning config default
+                shift=shift,  # Lightning config default
                 sample_solver="euler",  # Required for Lightning distillation
-                sampling_steps=4,  # Lightning 4-step generation
-                guide_scale=1.0,  # Lightning uses 1.0, no CFG needed
+                sampling_steps=sampling_steps,  # Lightning 4-step generation
+                guide_scale=guide_scale,  # Lightning uses 1.0, no CFG needed
                 seed=seed,
                 offload_model=False,  # Keep models on GPU for faster inference
             )
@@ -558,6 +566,9 @@ class VideoGenerator:
         image_bytes: bytes,
         prompt: str = DEFAULT_PROMPT,
         num_frames: int = 37,
+        shift: float = 5.0,
+        sampling_steps: int = 4,
+        guide_scale: float = 1.0,
         seed: Optional[int] = None,
         s3_key: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -566,6 +577,9 @@ class VideoGenerator:
             image_bytes=image_bytes,
             prompt=prompt,
             num_frames=num_frames,
+            shift=shift,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
             seed=seed,
             s3_key=s3_key,
         )
@@ -583,6 +597,9 @@ class VideoGenerator:
                 image_bytes=image_bytes,
                 prompt=request.prompt,
                 num_frames=request.num_frames,
+                shift=request.shift,
+                sampling_steps=request.sampling_steps,
+                guide_scale=request.guide_scale,
                 seed=request.seed,
                 s3_key=request.s3_key,
             )
@@ -594,6 +611,7 @@ class VideoGenerator:
                 "filename": result["filename"],
                 "s3_key": result["s3_key"],
                 "s3_url": result["s3_url"],
+                "cloudfront_url": f"https://dk4tmkcjtrceo.cloudfront.net/{result['s3_key']}",
                 "performance": result["performance"],
                 "message": "Video generation completed successfully",
                 "completed_at": time.time(),
@@ -655,6 +673,9 @@ class VideoGenerator:
                 image_bytes=image_bytes,
                 prompt=request.prompt,
                 num_frames=request.num_frames,
+                shift=request.shift,
+                sampling_steps=request.sampling_steps,
+                guide_scale=request.guide_scale,
                 seed=request.seed,
                 s3_key=request.s3_key,
             )
@@ -665,6 +686,7 @@ class VideoGenerator:
                 filename=result["filename"],
                 s3_key=result["s3_key"],
                 s3_url=result["s3_url"],
+                cloudfront_url=f"https://dk4tmkcjtrceo.cloudfront.net/{result['s3_key']}" if result["s3_key"] else None,
                 performance=result["performance"],
                 message="Video generation completed successfully",
             )
@@ -680,7 +702,15 @@ class VideoGenerator:
 
 
 @app.local_entrypoint()
-def main(image_path: str, prompt: str, seed: Optional[int] = None):
+def main(
+    image_path: str, 
+    prompt: str, 
+    seed: Optional[int] = None,
+    num_frames: int = 37,
+    shift: float = 5.0,
+    sampling_steps: int = 4,
+    guide_scale: float = 1.0,
+):
     """CLI: modal run wan2_modal.py --image-path cat.jpg --prompt "text" """
 
     # For CLI, load image as bytes (following CatVTON pattern)
@@ -701,7 +731,13 @@ def main(image_path: str, prompt: str, seed: Optional[int] = None):
 
     # Call the modal method wrapper for CLI access (like CatVTON)
     result = generator.inference.remote(
-        image_bytes=image_bytes, prompt=prompt, num_frames=37, seed=seed
+        image_bytes=image_bytes, 
+        prompt=prompt, 
+        num_frames=num_frames, 
+        shift=shift,
+        sampling_steps=sampling_steps,
+        guide_scale=guide_scale,
+        seed=seed
     )
 
     print(f"✅ Done in {time.time() - start:.1f}s")
