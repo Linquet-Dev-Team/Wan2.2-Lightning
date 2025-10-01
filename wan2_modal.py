@@ -126,7 +126,7 @@ with image.imports():
     timeout=20 * 60,
     volumes={MODEL_PATH: model_volume},
     secrets=[modal.Secret.from_name("aws-secret")],
-    min_containers=1,
+    min_containers=0,
     max_containers=1,  # Keep 1 container warm
     scaledown_window=60 * 20,  # 20 min idle timeout before scaling down (max)
     enable_memory_snapshot=True,  # Memory snapshot for faster cold starts
